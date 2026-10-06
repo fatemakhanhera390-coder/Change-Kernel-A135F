@@ -1,1319 +1,590 @@
-name: A135F 4.19.198 Advanced Kernel Build
+name: A135F 4.19.198 MAX-ARAF Kernel
 
 on:
   workflow_dispatch:
-    inputs:
-      profile:
-        description: Kernel tuning profile
-        required: true
-        type: choice
-        default: gaming
-        options:
-          - balanced
-          - performance
-          - gaming
-
-      toolchain:
-        description: Compiler mode. Auto = r383902 -> r353983c fallback
-        required: true
-        type: choice
-        default: auto
-        options:
-          - auto
-          - r383902
-          - r353983c
-
-      platform_version:
-        description: PLATFORM_VERSION. Auto follows build_kernel.sh if present.
-        required: true
-        type: choice
-        default: auto
-        options:
-          - auto
-          - "13"
-          - "12"
-
-      jobs:
-        description: Parallel jobs. 0 = all runner CPUs
-        required: true
-        type: string
-        default: "0"
 
 permissions:
   contents: read
 
-concurrency:
-  group: a135f-kernel-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
-  DEFCONFIG: exynos850-a13xx_defconfig
+  ARCH: arm64
+
   EXPECTED_KERNEL_VERSION: "4.19.198"
+  EXPECTED_DEFCONFIG: "exynos850-a13xx_defconfig"
+
   KERNEL_LOCALVERSION: "-MAX-ARAF"
 
-  CLANG_PRIMARY: r383902
-  CLANG_FALLBACK: r353983c
+  CLANG_VERSION: "clang-r383902"
+  CLANG_BRANCH: "android12-release"
 
+  SOURCE_DIR: "kernel-source"
+  OUT_DIR: "out"
 
-defaults:
-  run:
-    shell: bash
-
+  BUILD_JOBS: "4"
 
 jobs:
 
   build:
-    name: A135F ${{ inputs.profile }} / ${{ inputs.toolchain }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    name: Build A135F Kernel
+    runs-on: ubuntu-22.04
 
     steps:
 
-      # ==========================================================
-      # 1. CHECKOUT
-      # ==========================================================
+    # ------------------------------------------------------------
+    # 1. Checkout
+    # ------------------------------------------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
 
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+    # ------------------------------------------------------------
+    # 2. Install dependencies
+    # ------------------------------------------------------------
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        set -euxo pipefail
 
+        sudo apt-get update
 
-      # ==========================================================
-      # 2. FREE DISK SPACE
-      # ==========================================================
+        sudo apt-get install -y \
+          bc \
+          bison \
+          build-essential \
+          ccache \
+          cpio \
+          curl \
+          flex \
+          git \
+          libelf-dev \
+          libssl-dev \
+          lz4 \
+          rsync \
+          unzip \
+          wget \
+          xz-utils \
+          zip
 
-      - name: Free runner disk
-        run: |
-          set -euxo pipefail
+    # ------------------------------------------------------------
+    # 3. Locate kernel source automatically
+    # ------------------------------------------------------------
+    - name: Locate and validate kernel source
+      shell: bash
+      run: |
+        set -euo pipefail
 
-          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /usr/local/share/powershell || true
+        echo "=============================================="
+        echo " A135F KERNEL SOURCE DISCOVERY"
+        echo "=============================================="
 
-          echo "========== DISK =========="
-          df -h
+        ROOT="${GITHUB_WORKSPACE}"
 
+        candidates=()
 
-      # ==========================================================
-      # 3. DEPENDENCIES
-      # ==========================================================
+        # Preferred location
+        if [ -f "$ROOT/kernel-source/Makefile" ]; then
+          candidates+=("$ROOT/kernel-source")
+        fi
 
-      - name: Install kernel build dependencies
-        run: |
-          set -euxo pipefail
+        # Repository root
+        if [ -f "$ROOT/Makefile" ]; then
+          candidates+=("$ROOT")
+        fi
 
-          sudo apt-get update
+        # Automatic search
+        while IFS= read -r -d '' cfg; do
 
-          sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            cpio \
-            curl \
-            device-tree-compiler \
-            flex \
-            gawk \
-            git \
-            libelf-dev \
-            libfl-dev \
-            libncurses-dev \
-            libssl-dev \
-            lz4 \
-            rsync \
-            unzip \
-            wget \
-            xz-utils \
-            zip \
-            zstd
+          d="$(dirname "$cfg")"
 
-          echo "========== TOOL VERSIONS =========="
-          make --version | head -n 2
-          gcc --version | head -n 1
-          python3 --version
-          ccache --version | head -n 1
-
-
-      # ==========================================================
-      # 4. AUTO LOCATE KERNEL SOURCE
-      # ==========================================================
-
-      - name: Locate and validate A135F source
-        run: |
-          set -euxo pipefail
-
-          mapfile -t matches < <(
-            find . \
-              -maxdepth 8 \
-              -type f \
-              -path "*/arch/arm64/configs/$DEFCONFIG" \
-              -print | sort
-          )
-
-          if [ "${#matches[@]}" -eq 0 ]; then
-            echo "::error::Could not find $DEFCONFIG"
-            echo
-            echo "Expected Samsung A135F kernel source."
-            echo "Put the source at repository root or inside one subdirectory."
-            exit 1
-          fi
-
-          if [ "${#matches[@]}" -ne 1 ]; then
-            echo "::error::Multiple kernel source candidates found:"
-            printf '  %s\n' "${matches[@]}"
-            exit 1
-          fi
-
-          kernel_file="${matches[0]}"
-
-          kernel_dir="${kernel_file%/arch/arm64/configs/$DEFCONFIG}"
-
-          kernel_dir="$(realpath "$kernel_dir")"
-
-          test -f "$kernel_dir/Makefile"
-          test -f "$kernel_dir/Kconfig"
-          test -d "$kernel_dir/arch/arm64"
-          test -f "$kernel_dir/arch/arm64/configs/$DEFCONFIG"
-
-          actual_version="$(
-            cd "$kernel_dir"
-            make -s kernelversion
-          )"
-
-          echo "Detected kernel version: $actual_version"
-
-          if [ "$actual_version" != "$EXPECTED_KERNEL_VERSION" ]; then
-            echo "::error::Wrong kernel version."
-            echo "::error::Expected: $EXPECTED_KERNEL_VERSION"
-            echo "::error::Found:    $actual_version"
-            exit 1
-          fi
-
-          source_platform=""
-
-          if [ -f "$kernel_dir/build_kernel.sh" ]; then
-            source_platform="$(
-              grep -Eo \
-                'PLATFORM_VERSION=[0-9]+' \
-                "$kernel_dir/build_kernel.sh" \
-                | head -n 1 \
-                | cut -d= -f2 || true
+          kernel_root="$(dirname \
+            "$(dirname \
+              "$(dirname "$d")"
             )"
-          fi
-
-          [ -n "$source_platform" ] || source_platform=13
-
-          echo "KERNEL_DIR=$kernel_dir" >> "$GITHUB_ENV"
-          echo "SOURCE_PLATFORM_VERSION=$source_platform" >> "$GITHUB_ENV"
-
-          {
-            echo "===== A135F SOURCE VALIDATION ====="
-            echo
-            echo "Kernel directory:"
-            echo "$kernel_dir"
-            echo
-            echo "Kernel version:"
-            echo "$actual_version"
-            echo
-            echo "Defconfig:"
-            echo "$DEFCONFIG"
-            echo
-            echo "Source PLATFORM_VERSION:"
-            echo "$source_platform"
-            echo
-            echo "===== Makefile toolchain references ====="
-            grep -nE \
-              'clang-r[0-9]+|CROSS_COMPILE|CLANG_TRIPLE|^[[:space:]]*CC[[:space:]]*=' \
-              "$kernel_dir/Makefile" \
-              | head -n 100 || true
-            echo
-            echo "===== Version fields ====="
-            grep -E \
-              '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
-              "$kernel_dir/Makefile" \
-              || true
-          } | tee "$GITHUB_WORKSPACE/source-validation.txt"
-
-
-      # ==========================================================
-      # 5. CACHE
-      # ==========================================================
-
-      - name: Cache toolchains and ccache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ runner.temp }}/a135f-toolchains
-            ~/.cache/ccache
-          key: a135f-4.19.198-toolchains-v1-${{ runner.os }}
-
-
-      # ==========================================================
-      # 6. DOWNLOAD CLANG + GCC
-      # ==========================================================
-
-      - name: Download Samsung compatible toolchains
-        env:
-          TOOLCHAIN_CACHE: ${{ runner.temp }}/a135f-toolchains
-        run: |
-          set -euxo pipefail
-
-          mkdir -p "$TOOLCHAIN_CACHE"
-
-          download_archive() {
-            local url="$1"
-            local output="$2"
-
-            curl \
-              -fL \
-              --retry 10 \
-              --retry-delay 5 \
-              --retry-all-errors \
-              --connect-timeout 30 \
-              --max-time 1800 \
-              "$url" \
-              -o "$output"
-
-            test -s "$output"
-          }
-
-
-          fetch_clang() {
-            local version="$1"
-            local official="$2"
-            local mirror="$3"
-
-            local archive="$TOOLCHAIN_CACHE/clang-${version}.tar.gz"
-
-            if [ ! -s "$archive" ]; then
-
-              echo "Trying official AOSP source:"
-              echo "$official"
-
-              if ! download_archive "$official" "$archive"; then
-
-                echo "::warning::Official AOSP download failed."
-                echo "Trying mirror:"
-                echo "$mirror"
-
-                rm -f "$archive"
-
-                download_archive \
-                  "$mirror" \
-                  "$archive"
-              fi
-            fi
-
-            test -s "$archive"
-          }
-
-
-          # ----------------------------------------------------------
-          # CLANG r383902
-          # ----------------------------------------------------------
-
-          fetch_clang \
-            "r383902" \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r383902.tar.gz" \
-            "https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r383902.tar.gz"
-
-
-          # ----------------------------------------------------------
-          # CLANG r353983c
-          # ----------------------------------------------------------
-
-          fetch_clang \
-            "r353983c" \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r353983c.tar.gz" \
-            "https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r353983c.tar.gz"
-
-
-          # ----------------------------------------------------------
-          # AARCH64 GCC 4.9
-          # ----------------------------------------------------------
-
-          GCC_ARCHIVE="$TOOLCHAIN_CACHE/aarch64-linux-android-4.9.tar.gz"
-
-          if [ ! -s "$GCC_ARCHIVE" ]; then
-
-            download_archive \
-              "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/android-msm-barbet-4.19-android12-qpr1.tar.gz" \
-              "$GCC_ARCHIVE"
-
-          fi
-
-
-          # ----------------------------------------------------------
-          # EXTRACT
-          # ----------------------------------------------------------
-
-          rm -rf \
-            "$RUNNER_TEMP/clang-r383902" \
-            "$RUNNER_TEMP/clang-r353983c" \
-            "$RUNNER_TEMP/gcc"
-
-          mkdir -p \
-            "$RUNNER_TEMP/clang-r383902" \
-            "$RUNNER_TEMP/clang-r353983c" \
-            "$RUNNER_TEMP/gcc"
-
-          tar \
-            -xzf \
-            "$TOOLCHAIN_CACHE/clang-r383902.tar.gz" \
-            -C \
-            "$RUNNER_TEMP/clang-r383902"
-
-          tar \
-            -xzf \
-            "$TOOLCHAIN_CACHE/clang-r353983c.tar.gz" \
-            -C \
-            "$RUNNER_TEMP/clang-r353983c"
-
-          tar \
-            -xzf \
-            "$GCC_ARCHIVE" \
-            -C \
-            "$RUNNER_TEMP/gcc"
-
-
-          # ----------------------------------------------------------
-          # HARD VALIDATION
-          # ----------------------------------------------------------
-
-          test -x "$RUNNER_TEMP/clang-r383902/bin/clang"
-          test -x "$RUNNER_TEMP/clang-r353983c/bin/clang"
-
-          test -x \
-            "$RUNNER_TEMP/gcc/bin/aarch64-linux-android-gcc"
-
-          test -x \
-            "$RUNNER_TEMP/gcc/bin/aarch64-linux-android-ld"
-
-          echo "Toolchains extracted successfully."
-
-
-      # ==========================================================
-      # 7. VERIFY TOOLCHAIN
-      # ==========================================================
-
-      - name: Verify toolchain
-        run: |
-          set -euxo pipefail
-
-          echo "========== r383902 =========="
-          "$RUNNER_TEMP/clang-r383902/bin/clang" \
-            --version \
-            | head -n 3
-
-          echo
-          echo "========== r353983c =========="
-          "$RUNNER_TEMP/clang-r353983c/bin/clang" \
-            --version \
-            | head -n 3
-
-          echo
-          echo "========== GCC 4.9 =========="
-          "$RUNNER_TEMP/gcc/bin/aarch64-linux-android-gcc" \
-            --version \
-            | head -n 2
-
-
-      # ==========================================================
-      # 8. BUILD ENVIRONMENT
-      # ==========================================================
-
-      - name: Prepare legacy Samsung toolchain layout
-        run: |
-          set -euxo pipefail
-
-          KERNEL_PARENT="$(dirname "$KERNEL_DIR")"
-          GCC_ROOT="$RUNNER_TEMP/gcc"
-
-          mkdir -p \
-            "$KERNEL_DIR/toolchain/clang/host/linux-x86" \
-            "$KERNEL_PARENT/toolchain/clang/host/linux-x86" \
-            "$KERNEL_DIR/PLATFORM/prebuilts/gcc/linux-x86/aarch64" \
-            "$KERNEL_PARENT/PLATFORM/prebuilts/gcc/linux-x86/aarch64"
-
-          # Samsung Makefile compatibility:
-          #
-          # $(srctree)/toolchain/...
-          # $(srctree)/../toolchain/...
-          #
-          ln -sfn \
-            "$RUNNER_TEMP/clang-r383902" \
-            "$KERNEL_DIR/toolchain/clang/host/linux-x86/clang-r383902"
-
-          ln -sfn \
-            "$RUNNER_TEMP/clang-r383902" \
-            "$KERNEL_PARENT/toolchain/clang/host/linux-x86/clang-r383902"
-
-
-          # Samsung GCC compatibility:
-          #
-          # $(srctree)/../PLATFORM/...
-          #
-
-          ln -sfn \
-            "$GCC_ROOT" \
-            "$KERNEL_DIR/PLATFORM/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"
-
-          ln -sfn \
-            "$GCC_ROOT" \
-            "$KERNEL_PARENT/PLATFORM/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"
-
-
-          echo "Legacy Samsung toolchain layout ready."
-
-
-      # ==========================================================
-      # 9. MAIN BUILD
-      # ==========================================================
-
-      - name: Build kernel with automatic compiler fallback
-        env:
-          TOOLCHAIN_MODE: ${{ inputs.toolchain }}
-          PROFILE: ${{ inputs.profile }}
-          PLATFORM_MODE: ${{ inputs.platform_version }}
-          JOBS_INPUT: ${{ inputs.jobs }}
-        run: |
-          set -u -o pipefail
-
-          mkdir -p \
-            "$RUNNER_TEMP/build-logs" \
-            "$RUNNER_TEMP/diagnostics"
-
-          # --------------------------------------------------------
-          # JOB COUNT
-          # --------------------------------------------------------
-
-          JOBS="$JOBS_INPUT"
-
-          if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
-            echo "::error::jobs must be numeric."
-            exit 1
-          fi
-
-          if [ "$JOBS" -eq 0 ]; then
-            JOBS="$(nproc)"
-          fi
-
-          echo "Build jobs = $JOBS"
-
-
-          # --------------------------------------------------------
-          # PLATFORM VERSION
-          # --------------------------------------------------------
-
-          case "$PLATFORM_MODE" in
-
-            12)
-              PLATFORM_VERSION_RESOLVED=12
-              ;;
-
-            13)
-              PLATFORM_VERSION_RESOLVED=13
-              ;;
-
-            auto)
-              PLATFORM_VERSION_RESOLVED="$SOURCE_PLATFORM_VERSION"
-              ;;
-
-            *)
-              echo "::error::Invalid PLATFORM_VERSION mode."
-              exit 1
-              ;;
-
-          esac
-
-          export PLATFORM_VERSION="$PLATFORM_VERSION_RESOLVED"
-
-          if [ "$PLATFORM_VERSION_RESOLVED" = "12" ]; then
-            export ANDROID_MAJOR_VERSION=s
-          else
-            unset ANDROID_MAJOR_VERSION || true
-          fi
-
-          echo "PLATFORM_VERSION=$PLATFORM_VERSION_RESOLVED"
-
-
-          # --------------------------------------------------------
-          # TOOLCHAIN SETUP
-          # --------------------------------------------------------
-
-          setup_toolchain() {
-
-            local version="$1"
-
-            local root="$RUNNER_TEMP/clang-$version"
-
-            local gcc="$RUNNER_TEMP/gcc"
-
-            test -x "$root/bin/clang"
-            test -x "$gcc/bin/aarch64-linux-android-gcc"
-
-
-            export CLANG_ROOT="$root"
-
-            export CLANG="$root/bin/clang"
-
-            export CROSS_COMPILE="$gcc/bin/aarch64-linux-android-"
-
-            export CLANG_TRIPLE="$root/bin/aarch64-linux-gnu-"
-
-            export TOOLCHAIN_VERSION="$version"
-
-            export A135F_REAL_CLANG="$CLANG"
-
-
-            # ------------------------------------------------------
-            # LLVM PREFIX COMPATIBILITY
-            # ------------------------------------------------------
-
-            for name in \
-              ar \
-              nm \
-              objcopy \
-              objdump \
-              readelf \
-              size \
-              strings \
-              strip \
-              ranlib
-            do
-
-              if [ -e "$root/bin/llvm-$name" ]; then
-
-                ln -sfn \
-                  "llvm-$name" \
-                  "$root/bin/aarch64-linux-gnu-$name"
-
-              fi
-
-            done
-
-
-            if [ -e "$root/bin/ld.lld" ]; then
-
-              ln -sfn \
-                "ld.lld" \
-                "$root/bin/aarch64-linux-gnu-ld"
-
-            fi
-
-
-            # ------------------------------------------------------
-            # LEGACY CLANG PATH
-            # ------------------------------------------------------
-
-            ln -sfn \
-              "$root" \
-              "$KERNEL_DIR/toolchain/clang/host/linux-x86/clang-r383902"
-
-            ln -sfn \
-              "$root" \
-              "$(dirname "$KERNEL_DIR")/toolchain/clang/host/linux-x86/clang-r383902"
-
-
-            # ------------------------------------------------------
-            # CCACHE
-            # ------------------------------------------------------
-
-            export CCACHE_DIR="$HOME/.cache/ccache"
-
-            mkdir -p "$CCACHE_DIR"
-
-            export CCACHE_COMPILERCHECK=content
-
-            ccache -M 2G >/dev/null 2>&1 || true
-
-
-            cat > "$RUNNER_TEMP/clang-ccache-wrapper" <<EOF
-          #!/usr/bin/env bash
-          exec /usr/bin/ccache "$CLANG" "\$@"
-          EOF
-
-            chmod +x "$RUNNER_TEMP/clang-ccache-wrapper"
-
-
-            export KERNEL_CC="$RUNNER_TEMP/clang-ccache-wrapper"
-            export KERNEL_HOSTCC="$RUNNER_TEMP/clang-ccache-wrapper"
-
-
-            echo
-            echo "========== SELECTED TOOLCHAIN =========="
-            echo "Version        : $version"
-            echo "Clang          : $CLANG"
-            echo "CROSS_COMPILE  : $CROSS_COMPILE"
-            echo "CLANG_TRIPLE   : $CLANG_TRIPLE"
-            echo "========================================"
-            echo
-
-
-            "$CLANG" --version | head -n 3
-          }
-
-
-          # --------------------------------------------------------
-          # CONFIG SYMBOL HELPER
-          # --------------------------------------------------------
-
-          enable_if_present() {
-
-            local sym="$1"
-
-            if grep -Rqs \
-              --exclude-dir=.git \
-              --exclude-dir=out \
-              --exclude-dir=toolchain \
-              --include='Kconfig' \
-              --include='Kconfig.*' \
-              -E \
-              "^[[:space:]]*config[[:space:]]+${sym}([[:space:]]|$)" \
-              "$KERNEL_DIR"
-            then
-
-              "$KERNEL_DIR/scripts/config" \
-                --file "$KERNEL_DIR/out/.config" \
-                --enable \
-                "CONFIG_${sym}"
-
-              echo "[CONFIG] enabled CONFIG_${sym}"
-
-            else
-
-              echo "[CONFIG] CONFIG_${sym} not found -> skipped"
-
-            fi
-          }
-
-
-          # --------------------------------------------------------
-          # CONFIGURE
-          # --------------------------------------------------------
-
-          configure_kernel() {
-
-            cd "$KERNEL_DIR"
-
-            rm -rf out
-
-            mkdir -p out
-
-            chmod +x \
-              scripts/config \
-              scripts/diffconfig \
-              2>/dev/null || true
-
-
-            echo "========== DEFCONFIG =========="
-
-            make \
-              O=out \
-              ARCH=arm64 \
-              CROSS_COMPILE="$CROSS_COMPILE" \
-              CC="$KERNEL_CC" \
-              HOSTCC="$KERNEL_HOSTCC" \
-              CLANG_TRIPLE="$CLANG_TRIPLE" \
-              "$DEFCONFIG" \
-              2>&1 \
-              | tee \
-              "$RUNNER_TEMP/build-logs/config-${TOOLCHAIN_VERSION}.log"
-
-            rc=${PIPESTATUS[0]}
-
-            if [ "$rc" -ne 0 ]; then
-              return "$rc"
-            fi
-
-
-            # ------------------------------------------------------
-            # PROFILE
-            # ------------------------------------------------------
-
-            case "$PROFILE" in
-
-              balanced)
-
-                enable_if_present CPU_FREQ_GOV_PERFORMANCE
-                enable_if_present CPU_FREQ_GOV_ONDEMAND
-                enable_if_present CPU_FREQ_GOV_CONSERVATIVE
-                enable_if_present CPU_FREQ_GOV_SCHEDUTIL
-
-                ;;
-
-
-              performance)
-
-                enable_if_present CPU_FREQ_GOV_PERFORMANCE
-                enable_if_present CPU_FREQ_GOV_ONDEMAND
-                enable_if_present CPU_FREQ_GOV_CONSERVATIVE
-                enable_if_present CPU_FREQ_GOV_SCHEDUTIL
-
-                enable_if_present CPU_FREQ_DEFAULT_GOV_PERFORMANCE
-                enable_if_present CC_OPTIMIZE_FOR_PERFORMANCE
-
-                ;;
-
-
-              gaming)
-
-                enable_if_present CPU_FREQ_GOV_PERFORMANCE
-                enable_if_present CPU_FREQ_GOV_ONDEMAND
-                enable_if_present CPU_FREQ_GOV_CONSERVATIVE
-                enable_if_present CPU_FREQ_GOV_SCHEDUTIL
-
-                enable_if_present CPU_FREQ_DEFAULT_GOV_PERFORMANCE
-                enable_if_present CC_OPTIMIZE_FOR_PERFORMANCE
-
-                ;;
-
-
-              *)
-
-                echo "::error::Unknown profile: $PROFILE"
-                return 1
-
-                ;;
-
-            esac
-
-
-            # ------------------------------------------------------
-            # RESOLVE CONFIG DEPENDENCIES
-            # ------------------------------------------------------
-
-            echo "========== OLDDEFCONFIG =========="
-
-            make \
-              O=out \
-              ARCH=arm64 \
-              CROSS_COMPILE="$CROSS_COMPILE" \
-              CC="$KERNEL_CC" \
-              HOSTCC="$KERNEL_HOSTCC" \
-              CLANG_TRIPLE="$CLANG_TRIPLE" \
-              olddefconfig \
-              2>&1 \
-              | tee \
-              "$RUNNER_TEMP/build-logs/olddefconfig-${TOOLCHAIN_VERSION}.log"
-
-            rc=${PIPESTATUS[0]}
-
-            if [ "$rc" -ne 0 ]; then
-              return "$rc"
-            fi
-
-
-            # ------------------------------------------------------
-            # SAVE FINAL CONFIG
-            # ------------------------------------------------------
-
-            cp -f \
-              out/.config \
-              "$RUNNER_TEMP/build-logs/final-${TOOLCHAIN_VERSION}.config"
-
-
-            if [ -x ./scripts/diffconfig ]; then
-
-              ./scripts/diffconfig \
-                "arch/arm64/configs/$DEFCONFIG" \
-                "out/.config" \
-                > \
-                "$RUNNER_TEMP/build-logs/config-diff-${TOOLCHAIN_VERSION}.txt" \
-                2>&1 || true
-
-            fi
-
-
-            echo
-            echo "========== FINAL CONFIG CHECK =========="
-
-            grep -E \
-              '^CONFIG_CPU_FREQ_GOV_(PERFORMANCE|ONDEMAND|CONSERVATIVE|SCHEDUTIL)=' \
-              out/.config \
-              || true
-
-            grep -E \
-              '^CONFIG_CPU_FREQ_DEFAULT_GOV_' \
-              out/.config \
-              || true
-
-            grep -E \
-              '^CONFIG_CC_OPTIMIZE_FOR_' \
-              out/.config \
-              || true
-
-            echo
-          }
-
-
-          # --------------------------------------------------------
-          # BUILD ONE TOOLCHAIN
-          # --------------------------------------------------------
-
-          build_one() {
-
-            local version="$1"
-
-            echo
-            echo "############################################################"
-            echo "# TRYING TOOLCHAIN: $version"
-            echo "############################################################"
-            echo
-
-
-            setup_toolchain "$version"
-
-
-            if ! configure_kernel; then
-
-              echo "::warning::Configuration failed with $version"
-
-              return 1
-
-            fi
-
-
-            cd "$KERNEL_DIR"
-
-
-            echo "========== KERNEL BUILD =========="
-
-            set +e
-
-            make \
-              -j"$JOBS" \
-              O=out \
-              ARCH=arm64 \
-              CROSS_COMPILE="$CROSS_COMPILE" \
-              CC="$KERNEL_CC" \
-              HOSTCC="$KERNEL_HOSTCC" \
-              CLANG_TRIPLE="$CLANG_TRIPLE" \
-              LOCALVERSION="$KERNEL_LOCALVERSION" \
-              2>&1 \
-              | tee \
-              "$RUNNER_TEMP/build-logs/build-${version}.log"
-
-            local rc=${PIPESTATUS[0]}
-
-            set -e
-
-
-            if [ "$rc" -ne 0 ]; then
-
-              echo "::warning::Kernel build failed with $version"
-              echo "::warning::Exit code: $rc"
-
-              return "$rc"
-
-            fi
-
-
-            echo "========== OUTPUT CHECK =========="
-
-            test -s \
-              out/arch/arm64/boot/Image \
-              || return 1
-
-            test -s \
-              out/vmlinux \
-              || return 1
-
-            test -s \
-              out/System.map \
-              || return 1
-
-
-            echo
-            echo "============================================================"
-            echo "BUILD SUCCESS"
-            echo "Toolchain: $version"
-            echo "============================================================"
-            echo
-
-            return 0
-          }
-
-
-          # --------------------------------------------------------
-          # SMART TOOLCHAIN SELECTION
-          # --------------------------------------------------------
-
-          success=0
-
-
-          case "$TOOLCHAIN_MODE" in
-
-            r383902)
-
-              if build_one r383902; then
-                success=1
-              fi
-
-              ;;
-
-
-            r353983c)
-
-              if build_one r353983c; then
-                success=1
-              fi
-
-              ;;
-
-
-            auto)
-
-              if build_one r383902; then
-
-                success=1
-
-              else
-
-                echo "::notice::r383902 failed."
-                echo "::notice::Starting automatic fallback: r353983c"
-
-                if build_one r353983c; then
-                  success=1
-                fi
-
-              fi
-
-              ;;
-
-
-            *)
-
-              echo "::error::Invalid toolchain mode."
-              exit 1
-
-              ;;
-
-          esac
-
-
-          if [ "$success" -ne 1 ]; then
-
-            echo "::error::All selected toolchains failed."
-
-            exit 1
-
-          fi
-
-
-          echo "BUILT_TOOLCHAIN=$TOOLCHAIN_VERSION" >> "$GITHUB_ENV"
-
-          echo \
-            "BUILT_CLANG=$(
-              "$CLANG" --version | head -n 1
-            )" \
-            >> "$GITHUB_ENV"
-
-          echo "BUILD_JOBS=$JOBS" >> "$GITHUB_ENV"
-
-          echo \
-            "PLATFORM_VERSION_RESOLVED=$PLATFORM_VERSION_RESOLVED" \
-            >> "$GITHUB_ENV"
-
-
-      # ==========================================================
-      # 10. PACKAGE
-      # ==========================================================
-
-      - name: Package kernel artifacts
-        run: |
-          set -euxo pipefail
-
-          cd "$KERNEL_DIR"
-
-          test \
-            "$(make -s O=out kernelversion)" \
-            = \
-            "$EXPECTED_KERNEL_VERSION"
-
-          test -s out/arch/arm64/boot/Image
-          test -s out/vmlinux
-          test -s out/System.map
-
-
-          rm -rf "$RUNNER_TEMP/package"
-
-          mkdir -p \
-            "$RUNNER_TEMP/package" \
-            "$RUNNER_TEMP/package/modules"
-
-
-          # --------------------------------------------------------
-          # RAW KERNEL
-          # --------------------------------------------------------
-
-          cp \
-            out/arch/arm64/boot/Image \
-            "$RUNNER_TEMP/package/Image"
-
-
-          # Compressed copy for convenience.
-          gzip \
-            -c \
-            -9 \
-            out/arch/arm64/boot/Image \
-            > \
-            "$RUNNER_TEMP/package/Image.gz"
-
-
-          # --------------------------------------------------------
-          # OTHER BUILD OUTPUTS
-          # --------------------------------------------------------
-
-          cp \
-            out/vmlinux \
-            "$RUNNER_TEMP/package/vmlinux"
-
-          cp \
-            out/System.map \
-            "$RUNNER_TEMP/package/System.map"
-
-          cp \
-            out/.config \
-            "$RUNNER_TEMP/package/.config"
-
-
-          # --------------------------------------------------------
-          # MODULES
-          # --------------------------------------------------------
-
-          module_count=0
-
-          while IFS= read -r -d '' module
-          do
-
-            rel="${module#out/}"
-
-            mkdir -p \
-              "$RUNNER_TEMP/package/modules/$(dirname "$rel")"
-
-            cp -a \
-              "$module" \
-              "$RUNNER_TEMP/package/modules/$rel"
-
-            module_count=$((module_count + 1))
-
-          done < <(
-            find out \
-              -type f \
-              -name '*.ko' \
-              -print0
-          )
-
-
-          # --------------------------------------------------------
-          # DTB OUTPUT
-          # --------------------------------------------------------
-
-          if [ -d out/arch/arm64/boot/dts ]; then
-
-            tar \
-              -C out/arch/arm64/boot \
-              -czf \
-              "$RUNNER_TEMP/package/arm64-boot-dts.tar.gz" \
-              dts
-
-          fi
-
-
-          # --------------------------------------------------------
-          # BUILD INFO
-          # --------------------------------------------------------
-
-          image_size="$(
-            stat \
-              -c '%s' \
-              out/arch/arm64/boot/Image
           )"
 
-          vmlinux_size="$(
-            stat \
-              -c '%s' \
-              out/vmlinux
-          )"
+          if [ -f "$kernel_root/Makefile" ]; then
+            candidates+=("$kernel_root")
+          fi
 
-
-          {
-            echo "A135F 4.19.198 Advanced Kernel Build"
-            echo "======================================"
-            echo
-            echo "Kernel version : $(make -s O=out kernelversion)"
-            echo "Defconfig      : $DEFCONFIG"
-            echo "Profile        : ${{ inputs.profile }}"
-            echo "Toolchain      : $BUILT_TOOLCHAIN"
-            echo "Clang          : $BUILT_CLANG"
-            echo "Platform       : $PLATFORM_VERSION_RESOLVED"
-            echo "Build jobs     : $BUILD_JOBS"
-            echo "Localversion   : $KERNEL_LOCALVERSION"
-            echo "Image bytes    : $image_size"
-            echo "vmlinux bytes  : $vmlinux_size"
-            echo "Module count   : $module_count"
-            echo "Runner         : ubuntu-24.04"
-            echo "Commit         : $GITHUB_SHA"
-            echo "Run ID         : $GITHUB_RUN_ID"
-            echo
-            echo "Raw kernel artifacts only."
-            echo "NOT a flashable boot.img."
-            echo "Compilation success does NOT prove boot compatibility."
-          } | tee \
-            "$RUNNER_TEMP/package/BUILD_INFO.txt"
-
-
-          # --------------------------------------------------------
-          # SHA256
-          # --------------------------------------------------------
-
-          find \
-            "$RUNNER_TEMP/package" \
+        done < <(
+          find "$ROOT" \
             -type f \
+            -path '*/arch/arm64/configs/*defconfig' \
             -print0 \
-            | sort -z \
-            | xargs -0 sha256sum \
-            > \
-            "$RUNNER_TEMP/package/SHA256SUMS"
+            2>/dev/null
+        )
 
+        # Remove duplicates
+        mapfile -t candidates < <(
+          printf '%s\n' "${candidates[@]}" |
+          awk '!seen[$0]++'
+        )
 
-          # --------------------------------------------------------
-          # ZIP
-          # --------------------------------------------------------
+        echo
+        echo "Candidate kernel roots:"
+        printf '  %s\n' "${candidates[@]:-NONE}"
 
-          (
-            cd "$RUNNER_TEMP/package"
+        kernel_dir=""
 
-            zip \
-              -r9 \
-              "$GITHUB_WORKSPACE/A135F-4.19.198-${{ inputs.profile }}-${BUILT_TOOLCHAIN}.zip" \
-              .
-          )
+        for dir in "${candidates[@]}"; do
 
+          [ -f "$dir/Makefile" ] || continue
+          [ -d "$dir/arch/arm64" ] || continue
 
-      # ==========================================================
-      # 11. UPLOAD
-      # ==========================================================
+          version="$(
+            awk '$1=="VERSION" {print $3}' "$dir/Makefile" |
+            head -n1
+          )"
 
-      - name: Upload kernel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: A135F-4.19.198-${{ inputs.profile }}
-          if-no-files-found: error
-          compression-level: 0
-          path: |
-            A135F-4.19.198-*.zip
-            ${{ runner.temp }}/package/Image
-            ${{ runner.temp }}/package/Image.gz
-            ${{ runner.temp }}/package/vmlinux
-            ${{ runner.temp }}/package/System.map
-            ${{ runner.temp }}/package/.config
-            ${{ runner.temp }}/package/BUILD_INFO.txt
-            ${{ runner.temp }}/package/SHA256SUMS
-            ${{ runner.temp }}/package/arm64-boot-dts.tar.gz
-            ${{ runner.temp }}/package/modules/**
+          patchlevel="$(
+            awk '$1=="PATCHLEVEL" {print $3}' "$dir/Makefile" |
+            head -n1
+          )"
 
+          sublevel="$(
+            awk '$1=="SUBLEVEL" {print $3}' "$dir/Makefile" |
+            head -n1
+          )"
 
-      # ==========================================================
-      # 12. DIAGNOSTICS
-      # ==========================================================
+          kernel_version="${version}.${patchlevel}.${sublevel}"
 
-      - name: Collect diagnostics on failure
-        if: failure()
-        run: |
-          set +e
+          echo
+          echo "Checking:"
+          echo "  $dir"
+          echo "  version = $kernel_version"
 
-          mkdir -p "$RUNNER_TEMP/diagnostics"
-
-
-          {
-            echo "===== RUN ====="
-            echo "Run ID: $GITHUB_RUN_ID"
-            echo "Commit: $GITHUB_SHA"
-            echo "Profile: ${{ inputs.profile }}"
-            echo "Toolchain mode: ${{ inputs.toolchain }}"
-            echo "Platform mode: ${{ inputs.platform_version }}"
-            echo
-
-            echo "===== DISK ====="
-            df -h
-
-            echo
-            echo "===== MEMORY ====="
-            free -h
-
-            echo
-            echo "===== SOURCE ====="
-
-            if [ -n "${KERNEL_DIR:-}" ] &&
-               [ -d "$KERNEL_DIR" ]; then
-
-              cd "$KERNEL_DIR"
-
-              make -s kernelversion \
-                2>&1 || true
-
-              git status --short \
-                2>&1 || true
-
-              git diff --stat \
-                2>&1 || true
-
-              find . \
-                -type f \
-                \( \
-                  -name '*.rej' \
-                  -o \
-                  -name '*.orig' \
-                \) \
-                -not -path './.git/*' \
-                -print \
-                2>&1 || true
-
-            fi
-
-          } > \
-            "$RUNNER_TEMP/diagnostics/summary.txt" \
-            2>&1
-
-
-          cp -a \
-            "$RUNNER_TEMP/build-logs" \
-            "$RUNNER_TEMP/diagnostics/" \
-            2>/dev/null || true
-
-
-          cp -a \
-            "$GITHUB_WORKSPACE/source-validation.txt" \
-            "$RUNNER_TEMP/diagnostics/" \
-            2>/dev/null || true
-
-
-          if [ -n "${KERNEL_DIR:-}" ] &&
-             [ -d "$KERNEL_DIR/out" ]; then
-
-            cp -a \
-              "$KERNEL_DIR/out/.config" \
-              "$RUNNER_TEMP/diagnostics/" \
-              2>/dev/null || true
-
-            cp -a \
-              "$KERNEL_DIR/out/.config.old" \
-              "$RUNNER_TEMP/diagnostics/" \
-              2>/dev/null || true
-
+          if [ "$kernel_version" = "$EXPECTED_KERNEL_VERSION" ]; then
+            kernel_dir="$dir"
+            break
           fi
 
+        done
 
-      - name: Upload build diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: A135F-build-diagnostics
-          if-no-files-found: warn
-          compression-level: 6
-          path: |
-            ${{ runner.temp }}/diagnostics/**
+        if [ -z "$kernel_dir" ]; then
+
+          echo
+          echo "::error::No matching $EXPECTED_KERNEL_VERSION kernel source found."
+
+          echo
+          echo "Available kernel versions:"
+
+          for dir in "${candidates[@]}"; do
+
+            [ -f "$dir/Makefile" ] || continue
+
+            v="$(
+              awk '$1=="VERSION" {print $3}' "$dir/Makefile" |
+              head -n1
+            )"
+
+            p="$(
+              awk '$1=="PATCHLEVEL" {print $3}' "$dir/Makefile" |
+              head -n1
+            )"
+
+            s="$(
+              awk '$1=="SUBLEVEL" {print $3}' "$dir/Makefile" |
+              head -n1
+            )"
+
+            echo "  $dir -> $v.$p.$s"
+
+          done
+
+          exit 1
+        fi
+
+        echo
+        echo "=============================================="
+        echo " SELECTED KERNEL"
+        echo "=============================================="
+
+        echo "KERNEL_DIR=$kernel_dir"
+
+        # Find requested defconfig
+        defconfig=""
+
+        if [ -f "$kernel_dir/arch/arm64/configs/$EXPECTED_DEFCONFIG" ]; then
+          defconfig="$EXPECTED_DEFCONFIG"
+        fi
+
+        # Automatic fallback
+        if [ -z "$defconfig" ]; then
+
+          mapfile -t defs < <(
+            find "$kernel_dir/arch/arm64/configs" \
+              -maxdepth 1 \
+              -type f \
+              -name '*defconfig' \
+              -printf '%f\n' |
+            sort
+          )
+
+          echo
+          echo "Available defconfigs:"
+          printf '  %s\n' "${defs[@]:-NONE}"
+
+          # Search Exynos850/A13 candidates
+          for d in "${defs[@]}"; do
+            case "$d" in
+              *exynos850*a13*|*a13*exynos850*)
+                defconfig="$d"
+                break
+                ;;
+            esac
+          done
+        fi
+
+        if [ -z "$defconfig" ]; then
+          echo "::error::No suitable A135F/Exynos850 defconfig found."
+          exit 1
+        fi
+
+        echo "DEFCONFIG=$defconfig"
+
+        # Export for following steps
+        {
+          echo "KERNEL_DIR=$kernel_dir"
+          echo "DEFCONFIG=$defconfig"
+          echo "KERNEL_VERSION=$EXPECTED_KERNEL_VERSION"
+        } >> "$GITHUB_ENV"
+
+    # ------------------------------------------------------------
+    # 4. Print source information
+    # ------------------------------------------------------------
+    - name: Inspect kernel source
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cd "$KERNEL_DIR"
+
+        echo "=============================================="
+        echo " KERNEL SOURCE INFORMATION"
+        echo "=============================================="
+
+        echo
+        echo "Kernel version:"
+        make kernelversion
+
+        echo
+        echo "Makefile version fields:"
+        grep -E \
+          '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
+          Makefile || true
+
+        echo
+        echo "Architecture:"
+        grep -E \
+          '^(ARCH|SUBARCH|CROSS_COMPILE|CLANG_TRIPLE|CC)[[:space:]]*=' \
+          Makefile || true
+
+        echo
+        echo "Defconfig:"
+        ls -lh "arch/arm64/configs/$DEFCONFIG"
+
+        echo
+        echo "Possible Samsung toolchains:"
+        find . \
+          -maxdepth 8 \
+          \( \
+            -iname '*clang-r*' \
+            -o \
+            -iname '*gcc*' \
+          \) \
+          -print 2>/dev/null |
+          head -100 || true
+
+    # ------------------------------------------------------------
+    # 5. Download exact AOSP Clang
+    # ------------------------------------------------------------
+    - name: Download Clang r383902
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        TOOLCHAIN="$RUNNER_TEMP/aosp-clang"
+
+        mkdir -p "$TOOLCHAIN"
+
+        echo "Downloading AOSP $CLANG_VERSION..."
+
+        git clone \
+          --depth=1 \
+          --filter=blob:none \
+          --sparse \
+          --branch="$CLANG_BRANCH" \
+          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86.git \
+          "$TOOLCHAIN"
+
+        cd "$TOOLCHAIN"
+
+        git sparse-checkout set \
+          "$CLANG_VERSION"
+
+        if [ ! -x "$TOOLCHAIN/$CLANG_VERSION/bin/clang" ]; then
+          echo "::error::clang-r383902 was not found."
+          exit 1
+        fi
+
+        echo "CLANG_PATH=$TOOLCHAIN/$CLANG_VERSION/bin" >> "$GITHUB_ENV"
+
+        echo
+        echo "Compiler:"
+        "$TOOLCHAIN/$CLANG_VERSION/bin/clang" --version
+
+    # ------------------------------------------------------------
+    # 6. Prepare cross compiler
+    # ------------------------------------------------------------
+    - name: Prepare cross compiler
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "=============================================="
+        echo " CROSS COMPILER"
+        echo "=============================================="
+
+        CLANG="$CLANG_PATH/clang"
+
+        # Modern LLVM can generate the ARM64 kernel directly.
+        #
+        # We still provide a GNU-style CROSS_COMPILE prefix
+        # because old Android kernel Makefiles expect it.
+
+        if [ -x "$CLANG_PATH/llvm-ar" ]; then
+          echo "LLVM tools detected."
+        fi
+
+        echo "CLANG=$CLANG"
+        echo "CLANG_PATH=$CLANG_PATH"
+
+        echo "CLANG_PATH=$CLANG_PATH" >> "$GITHUB_ENV"
+
+    # ------------------------------------------------------------
+    # 7. Clean build directory
+    # ------------------------------------------------------------
+    - name: Prepare build directory
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        rm -rf "$GITHUB_WORKSPACE/$OUT_DIR"
+
+        mkdir -p "$GITHUB_WORKSPACE/$OUT_DIR"
+
+        echo "OUT=$GITHUB_WORKSPACE/$OUT_DIR" >> "$GITHUB_ENV"
+
+    # ------------------------------------------------------------
+    # 8. Configure kernel
+    # ------------------------------------------------------------
+    - name: Configure kernel
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cd "$KERNEL_DIR"
+
+        export ARCH=arm64
+        export SUBARCH=arm64
+
+        export LLVM="$CLANG_PATH/"
+        export LLVM_IAS=1
+
+        echo "=============================================="
+        echo " CONFIGURING KERNEL"
+        echo "=============================================="
+
+        make \
+          O="$OUT" \
+          ARCH=arm64 \
+          LLVM="$CLANG_PATH/" \
+          LLVM_IAS=1 \
+          "$DEFCONFIG"
+
+        echo
+        echo "Configuration generated."
+
+        if [ ! -f "$OUT/.config" ]; then
+          echo "::error::.config was not generated."
+          exit 1
+        fi
+
+    # ------------------------------------------------------------
+    # 9. Apply optional modifications
+    # ------------------------------------------------------------
+    - name: Apply kernel modifications
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -f "$GITHUB_WORKSPACE/patches/apply.sh" ]; then
+
+          echo "Applying custom modifications..."
+
+          chmod +x "$GITHUB_WORKSPACE/patches/apply.sh"
+
+          "$GITHUB_WORKSPACE/patches/apply.sh" \
+            "$KERNEL_DIR" \
+            "$OUT"
+
+        else
+
+          echo "No patches/apply.sh found."
+          echo "Building clean Samsung source."
+
+        fi
+
+    # ------------------------------------------------------------
+    # 10. Re-check configuration
+    # ------------------------------------------------------------
+    - name: Validate final configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cd "$KERNEL_DIR"
+
+        echo "=============================================="
+        echo " FINAL CONFIG CHECK"
+        echo "=============================================="
+
+        scripts/config \
+          --file "$OUT/.config" \
+          --enable CONFIG_MODULES 2>/dev/null || true
+
+        echo
+        echo "Kernel release:"
+        make \
+          O="$OUT" \
+          ARCH=arm64 \
+          LLVM="$CLANG_PATH/" \
+          LLVM_IAS=1 \
+          kernelrelease || true
+
+    # ------------------------------------------------------------
+    # 11. Build kernel
+    # ------------------------------------------------------------
+    - name: Build kernel
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cd "$KERNEL_DIR"
+
+        export ARCH=arm64
+        export SUBARCH=arm64
+
+        echo "=============================================="
+        echo " BUILDING KERNEL"
+        echo "=============================================="
+
+        echo
+        echo "Compiler:"
+        "$CLANG_PATH/clang" --version | head -n3
+
+        echo
+        echo "Jobs: $BUILD_JOBS"
+
+        make \
+          O="$OUT" \
+          ARCH=arm64 \
+          LLVM="$CLANG_PATH/" \
+          LLVM_IAS=1 \
+          LOCALVERSION="$KERNEL_LOCALVERSION" \
+          -j"$BUILD_JOBS"
+
+    # ------------------------------------------------------------
+    # 12. Verify output
+    # ------------------------------------------------------------
+    - name: Verify kernel output
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "=============================================="
+        echo " BUILD OUTPUT"
+        echo "=============================================="
+
+        echo
+        echo "Kernel image:"
+
+        if [ -f "$OUT/arch/arm64/boot/Image" ]; then
+          ls -lh "$OUT/arch/arm64/boot/Image"
+        else
+          echo "::error::Image was not generated."
+          exit 1
+        fi
+
+        echo
+        echo "Kernel release:"
+
+        cd "$KERNEL_DIR"
+
+        make \
+          O="$OUT" \
+          ARCH=arm64 \
+          LLVM="$CLANG_PATH/" \
+          LLVM_IAS=1 \
+          kernelrelease
+
+        echo
+        echo "VMLINUX:"
+        if [ -f "$OUT/vmlinux" ]; then
+          ls -lh "$OUT/vmlinux"
+        fi
+
+    # ------------------------------------------------------------
+    # 13. Package
+    # ------------------------------------------------------------
+    - name: Package kernel
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        PKG="$GITHUB_WORKSPACE/package"
+
+        rm -rf "$PKG"
+        mkdir -p "$PKG"
+
+        cp \
+          "$OUT/arch/arm64/boot/Image" \
+          "$PKG/Image"
+
+        if [ -d "$OUT/arch/arm64/boot/dts" ]; then
+          cp -a \
+            "$OUT/arch/arm64/boot/dts" \
+            "$PKG/dts"
+        fi
+
+        if [ -f "$OUT/System.map" ]; then
+          cp "$OUT/System.map" "$PKG/"
+        fi
+
+        if [ -f "$OUT/.config" ]; then
+          cp "$OUT/.config" "$PKG/kernel.config"
+        fi
+
+        if [ -f "$OUT/vmlinux" ]; then
+          cp "$OUT/vmlinux" "$PKG/vmlinux"
+        fi
+
+        cd "$PKG"
+
+        zip -r \
+          "$GITHUB_WORKSPACE/A135F-4.19.198-MAX-ARAF.zip" \
+          .
+
+    # ------------------------------------------------------------
+    # 14. Upload artifact
+    # ------------------------------------------------------------
+    - name: Upload kernel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: A135F-4.19.198-MAX-ARAF
+        path: |
+          A135F-4.19.198-MAX-ARAF.zip
+          package/
+        if-no-files-found: error
+        compression-level: 0
