@@ -1,4 +1,4 @@
-name: Build A135F Official Kernel 4.19.198
+nname: Build A135F Official Kernel 4.19.198
 
 on:
   workflow_dispatch:
