@@ -1,590 +1,809 @@
-name: A135F 4.19.198 MAX-ARAF Kernel
+name: A135F 4.19.198 Kernel Build
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Source Release tag"
+        required: true
+        default: "v4.19.198"
 
-permissions:
-  contents: read
+      source_asset:
+        description: "Samsung OpenSource ZIP asset name"
+        required: true
+        default: "SM-A135F_14_Opensource.1.zip"
+
+      jobs:
+        description: "Parallel build jobs"
+        required: true
+        default: "2"
 
 env:
-  ARCH: arm64
-
   EXPECTED_KERNEL_VERSION: "4.19.198"
   EXPECTED_DEFCONFIG: "exynos850-a13xx_defconfig"
-
   KERNEL_LOCALVERSION: "-MAX-ARAF"
 
-  CLANG_VERSION: "clang-r383902"
-  CLANG_BRANCH: "android12-release"
+  # Samsung/AOSP old kernel toolchain
+  CLANG_RELEASE: "clang-r383902"
 
-  SOURCE_DIR: "kernel-source"
-  OUT_DIR: "out"
+  # Optional SHA256 verification.
+  # Leave empty unless you know the complete SHA256.
+  SOURCE_SHA256: ""
 
-  BUILD_JOBS: "4"
+  DEBIAN_FRONTEND: noninteractive
 
 jobs:
-
   build:
-    name: Build A135F Kernel
+    name: Build A135F Kernel 4.19.198
     runs-on: ubuntu-22.04
+
+    permissions:
+      contents: read
 
     steps:
 
-    # ------------------------------------------------------------
-    # 1. Checkout
-    # ------------------------------------------------------------
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 1
+      # ============================================================
+      # 1. CHECKOUT WORKFLOW REPOSITORY
+      # ============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-    # ------------------------------------------------------------
-    # 2. Install dependencies
-    # ------------------------------------------------------------
-    - name: Install build dependencies
-      shell: bash
-      run: |
-        set -euxo pipefail
+      # ============================================================
+      # 2. HOST DEPENDENCIES
+      # ============================================================
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        sudo apt-get update
+          sudo apt-get update
 
-        sudo apt-get install -y \
-          bc \
-          bison \
-          build-essential \
-          ccache \
-          cpio \
-          curl \
-          flex \
-          git \
-          libelf-dev \
-          libssl-dev \
-          lz4 \
-          rsync \
-          unzip \
-          wget \
-          xz-utils \
-          zip
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            gcc \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            libdw-dev \
+            lz4 \
+            make \
+            python3 \
+            python3-pip \
+            rsync \
+            tar \
+            unzip \
+            zip \
+            wget \
+            xz-utils \
+            zstd \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu
 
-    # ------------------------------------------------------------
-    # 3. Locate kernel source automatically
-    # ------------------------------------------------------------
-    - name: Locate and validate kernel source
-      shell: bash
-      run: |
-        set -euo pipefail
+          echo "Host dependencies installed."
 
-        echo "=============================================="
-        echo " A135F KERNEL SOURCE DISCOVERY"
-        echo "=============================================="
+      # ============================================================
+      # 3. DOWNLOAD SAMSUNG SOURCE FROM RELEASE
+      # ============================================================
+      - name: Download Samsung OpenSource package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        ROOT="${GITHUB_WORKSPACE}"
+          mkdir -p "$GITHUB_WORKSPACE/source-download"
 
-        candidates=()
+          cd "$GITHUB_WORKSPACE/source-download"
 
-        # Preferred location
-        if [ -f "$ROOT/kernel-source/Makefile" ]; then
-          candidates+=("$ROOT/kernel-source")
-        fi
+          echo "=============================================="
+          echo "Release : $RELEASE_TAG"
+          echo "Asset   : $SOURCE_ASSET"
+          echo "=============================================="
 
-        # Repository root
-        if [ -f "$ROOT/Makefile" ]; then
-          candidates+=("$ROOT")
-        fi
+          gh release download "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "$SOURCE_ASSET" \
+            --clobber
 
-        # Automatic search
-        while IFS= read -r -d '' cfg; do
+          test -f "$SOURCE_ASSET"
 
-          d="$(dirname "$cfg")"
+          echo
+          echo "Downloaded:"
+          ls -lh "$SOURCE_ASSET"
 
-          kernel_root="$(dirname \
-            "$(dirname \
-              "$(dirname "$d")"
-            )"
-          )"
+          echo
+          echo "SHA256:"
+          sha256sum "$SOURCE_ASSET"
 
-          if [ -f "$kernel_root/Makefile" ]; then
-            candidates+=("$kernel_root")
+          if [ -n "${SOURCE_SHA256}" ]; then
+            echo
+            echo "Checking source SHA256..."
+            echo "${SOURCE_SHA256}  ${SOURCE_ASSET}" | sha256sum -c -
           fi
 
-        done < <(
-          find "$ROOT" \
-            -type f \
-            -path '*/arch/arm64/configs/*defconfig' \
-            -print0 \
-            2>/dev/null
-        )
+      # ============================================================
+      # 4. EXTRACT OUTER ZIP
+      # ============================================================
+      - name: Extract OpenSource package
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        # Remove duplicates
-        mapfile -t candidates < <(
-          printf '%s\n' "${candidates[@]}" |
-          awk '!seen[$0]++'
-        )
+          DOWNLOAD_DIR="$GITHUB_WORKSPACE/source-download"
+          OUTER_DIR="$GITHUB_WORKSPACE/outer-source"
 
-        echo
-        echo "Candidate kernel roots:"
-        printf '  %s\n' "${candidates[@]:-NONE}"
+          rm -rf "$OUTER_DIR"
+          mkdir -p "$OUTER_DIR"
 
-        kernel_dir=""
+          SOURCE_ASSET="${{ inputs.source_asset }}"
 
-        for dir in "${candidates[@]}"; do
+          echo "Extracting:"
+          echo "$SOURCE_ASSET"
 
-          [ -f "$dir/Makefile" ] || continue
-          [ -d "$dir/arch/arm64" ] || continue
-
-          version="$(
-            awk '$1=="VERSION" {print $3}' "$dir/Makefile" |
-            head -n1
-          )"
-
-          patchlevel="$(
-            awk '$1=="PATCHLEVEL" {print $3}' "$dir/Makefile" |
-            head -n1
-          )"
-
-          sublevel="$(
-            awk '$1=="SUBLEVEL" {print $3}' "$dir/Makefile" |
-            head -n1
-          )"
-
-          kernel_version="${version}.${patchlevel}.${sublevel}"
+          unzip -q "$DOWNLOAD_DIR/$SOURCE_ASSET" -d "$OUTER_DIR"
 
           echo
-          echo "Checking:"
-          echo "  $dir"
-          echo "  version = $kernel_version"
+          echo "Outer package contents:"
+          find "$OUTER_DIR" -maxdepth 4 -type f \
+            \( -name "*.tar.gz" -o -name "*.txt" -o -name "*.zip" \) \
+            -print | sort
 
-          if [ "$kernel_version" = "$EXPECTED_KERNEL_VERSION" ]; then
-            kernel_dir="$dir"
-            break
-          fi
+      # ============================================================
+      # 5. FIND Kernel.tar.gz AUTOMATICALLY
+      # ============================================================
+      - name: Locate Kernel.tar.gz
+        id: kernel_archive
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        done
+          OUTER_DIR="$GITHUB_WORKSPACE/outer-source"
 
-        if [ -z "$kernel_dir" ]; then
-
-          echo
-          echo "::error::No matching $EXPECTED_KERNEL_VERSION kernel source found."
-
-          echo
-          echo "Available kernel versions:"
-
-          for dir in "${candidates[@]}"; do
-
-            [ -f "$dir/Makefile" ] || continue
-
-            v="$(
-              awk '$1=="VERSION" {print $3}' "$dir/Makefile" |
-              head -n1
-            )"
-
-            p="$(
-              awk '$1=="PATCHLEVEL" {print $3}' "$dir/Makefile" |
-              head -n1
-            )"
-
-            s="$(
-              awk '$1=="SUBLEVEL" {print $3}' "$dir/Makefile" |
-              head -n1
-            )"
-
-            echo "  $dir -> $v.$p.$s"
-
-          done
-
-          exit 1
-        fi
-
-        echo
-        echo "=============================================="
-        echo " SELECTED KERNEL"
-        echo "=============================================="
-
-        echo "KERNEL_DIR=$kernel_dir"
-
-        # Find requested defconfig
-        defconfig=""
-
-        if [ -f "$kernel_dir/arch/arm64/configs/$EXPECTED_DEFCONFIG" ]; then
-          defconfig="$EXPECTED_DEFCONFIG"
-        fi
-
-        # Automatic fallback
-        if [ -z "$defconfig" ]; then
-
-          mapfile -t defs < <(
-            find "$kernel_dir/arch/arm64/configs" \
-              -maxdepth 1 \
+          mapfile -d '' KERNEL_ARCHIVES < <(
+            find "$OUTER_DIR" \
               -type f \
-              -name '*defconfig' \
-              -printf '%f\n' |
-            sort
+              \( -name "Kernel.tar.gz" -o -name "Kernel.tar" \) \
+              -print0
           )
 
+          if [ "${#KERNEL_ARCHIVES[@]}" -eq 0 ]; then
+            echo "::error::Kernel.tar.gz was not found inside Samsung OpenSource package."
+            echo
+            echo "All files:"
+            find "$OUTER_DIR" -type f -print | sort
+            exit 1
+          fi
+
+          KERNEL_ARCHIVE="${KERNEL_ARCHIVES[0]}"
+
+          echo "Found kernel archive:"
+          echo "$KERNEL_ARCHIVE"
+
+          echo "kernel_archive=$KERNEL_ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 6. EXTRACT REAL KERNEL SOURCE
+      # ============================================================
+      - name: Extract kernel source
+        shell: bash
+        env:
+          KERNEL_ARCHIVE: ${{ steps.kernel_archive.outputs.kernel_archive }}
+        run: |
+          set -euo pipefail
+
+          KERNEL_UNPACK="$GITHUB_WORKSPACE/kernel-unpack"
+
+          rm -rf "$KERNEL_UNPACK"
+          mkdir -p "$KERNEL_UNPACK"
+
+          echo "Extracting kernel:"
+          echo "$KERNEL_ARCHIVE"
+
+          tar -xzf "$KERNEL_ARCHIVE" -C "$KERNEL_UNPACK"
+
           echo
-          echo "Available defconfigs:"
-          printf '  %s\n' "${defs[@]:-NONE}"
-
-          # Search Exynos850/A13 candidates
-          for d in "${defs[@]}"; do
-            case "$d" in
-              *exynos850*a13*|*a13*exynos850*)
-                defconfig="$d"
-                break
-                ;;
-            esac
-          done
-        fi
-
-        if [ -z "$defconfig" ]; then
-          echo "::error::No suitable A135F/Exynos850 defconfig found."
-          exit 1
-        fi
-
-        echo "DEFCONFIG=$defconfig"
-
-        # Export for following steps
-        {
-          echo "KERNEL_DIR=$kernel_dir"
-          echo "DEFCONFIG=$defconfig"
-          echo "KERNEL_VERSION=$EXPECTED_KERNEL_VERSION"
-        } >> "$GITHUB_ENV"
-
-    # ------------------------------------------------------------
-    # 4. Print source information
-    # ------------------------------------------------------------
-    - name: Inspect kernel source
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        cd "$KERNEL_DIR"
-
-        echo "=============================================="
-        echo " KERNEL SOURCE INFORMATION"
-        echo "=============================================="
-
-        echo
-        echo "Kernel version:"
-        make kernelversion
-
-        echo
-        echo "Makefile version fields:"
-        grep -E \
-          '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
-          Makefile || true
-
-        echo
-        echo "Architecture:"
-        grep -E \
-          '^(ARCH|SUBARCH|CROSS_COMPILE|CLANG_TRIPLE|CC)[[:space:]]*=' \
-          Makefile || true
-
-        echo
-        echo "Defconfig:"
-        ls -lh "arch/arm64/configs/$DEFCONFIG"
-
-        echo
-        echo "Possible Samsung toolchains:"
-        find . \
-          -maxdepth 8 \
-          \( \
-            -iname '*clang-r*' \
-            -o \
-            -iname '*gcc*' \
-          \) \
-          -print 2>/dev/null |
-          head -100 || true
-
-    # ------------------------------------------------------------
-    # 5. Download exact AOSP Clang
-    # ------------------------------------------------------------
-    - name: Download Clang r383902
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        TOOLCHAIN="$RUNNER_TEMP/aosp-clang"
-
-        mkdir -p "$TOOLCHAIN"
-
-        echo "Downloading AOSP $CLANG_VERSION..."
-
-        git clone \
-          --depth=1 \
-          --filter=blob:none \
-          --sparse \
-          --branch="$CLANG_BRANCH" \
-          https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86.git \
-          "$TOOLCHAIN"
-
-        cd "$TOOLCHAIN"
-
-        git sparse-checkout set \
-          "$CLANG_VERSION"
-
-        if [ ! -x "$TOOLCHAIN/$CLANG_VERSION/bin/clang" ]; then
-          echo "::error::clang-r383902 was not found."
-          exit 1
-        fi
-
-        echo "CLANG_PATH=$TOOLCHAIN/$CLANG_VERSION/bin" >> "$GITHUB_ENV"
-
-        echo
-        echo "Compiler:"
-        "$TOOLCHAIN/$CLANG_VERSION/bin/clang" --version
-
-    # ------------------------------------------------------------
-    # 6. Prepare cross compiler
-    # ------------------------------------------------------------
-    - name: Prepare cross compiler
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        echo "=============================================="
-        echo " CROSS COMPILER"
-        echo "=============================================="
-
-        CLANG="$CLANG_PATH/clang"
-
-        # Modern LLVM can generate the ARM64 kernel directly.
-        #
-        # We still provide a GNU-style CROSS_COMPILE prefix
-        # because old Android kernel Makefiles expect it.
-
-        if [ -x "$CLANG_PATH/llvm-ar" ]; then
-          echo "LLVM tools detected."
-        fi
-
-        echo "CLANG=$CLANG"
-        echo "CLANG_PATH=$CLANG_PATH"
-
-        echo "CLANG_PATH=$CLANG_PATH" >> "$GITHUB_ENV"
-
-    # ------------------------------------------------------------
-    # 7. Clean build directory
-    # ------------------------------------------------------------
-    - name: Prepare build directory
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        rm -rf "$GITHUB_WORKSPACE/$OUT_DIR"
-
-        mkdir -p "$GITHUB_WORKSPACE/$OUT_DIR"
-
-        echo "OUT=$GITHUB_WORKSPACE/$OUT_DIR" >> "$GITHUB_ENV"
-
-    # ------------------------------------------------------------
-    # 8. Configure kernel
-    # ------------------------------------------------------------
-    - name: Configure kernel
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        cd "$KERNEL_DIR"
-
-        export ARCH=arm64
-        export SUBARCH=arm64
-
-        export LLVM="$CLANG_PATH/"
-        export LLVM_IAS=1
-
-        echo "=============================================="
-        echo " CONFIGURING KERNEL"
-        echo "=============================================="
-
-        make \
-          O="$OUT" \
-          ARCH=arm64 \
-          LLVM="$CLANG_PATH/" \
-          LLVM_IAS=1 \
-          "$DEFCONFIG"
-
-        echo
-        echo "Configuration generated."
-
-        if [ ! -f "$OUT/.config" ]; then
-          echo "::error::.config was not generated."
-          exit 1
-        fi
-
-    # ------------------------------------------------------------
-    # 9. Apply optional modifications
-    # ------------------------------------------------------------
-    - name: Apply kernel modifications
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        if [ -f "$GITHUB_WORKSPACE/patches/apply.sh" ]; then
-
-          echo "Applying custom modifications..."
-
-          chmod +x "$GITHUB_WORKSPACE/patches/apply.sh"
-
-          "$GITHUB_WORKSPACE/patches/apply.sh" \
-            "$KERNEL_DIR" \
-            "$OUT"
-
-        else
-
-          echo "No patches/apply.sh found."
-          echo "Building clean Samsung source."
-
-        fi
-
-    # ------------------------------------------------------------
-    # 10. Re-check configuration
-    # ------------------------------------------------------------
-    - name: Validate final configuration
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        cd "$KERNEL_DIR"
-
-        echo "=============================================="
-        echo " FINAL CONFIG CHECK"
-        echo "=============================================="
-
-        scripts/config \
-          --file "$OUT/.config" \
-          --enable CONFIG_MODULES 2>/dev/null || true
-
-        echo
-        echo "Kernel release:"
-        make \
-          O="$OUT" \
-          ARCH=arm64 \
-          LLVM="$CLANG_PATH/" \
-          LLVM_IAS=1 \
-          kernelrelease || true
-
-    # ------------------------------------------------------------
-    # 11. Build kernel
-    # ------------------------------------------------------------
-    - name: Build kernel
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        cd "$KERNEL_DIR"
-
-        export ARCH=arm64
-        export SUBARCH=arm64
-
-        echo "=============================================="
-        echo " BUILDING KERNEL"
-        echo "=============================================="
-
-        echo
-        echo "Compiler:"
-        "$CLANG_PATH/clang" --version | head -n3
-
-        echo
-        echo "Jobs: $BUILD_JOBS"
-
-        make \
-          O="$OUT" \
-          ARCH=arm64 \
-          LLVM="$CLANG_PATH/" \
-          LLVM_IAS=1 \
-          LOCALVERSION="$KERNEL_LOCALVERSION" \
-          -j"$BUILD_JOBS"
-
-    # ------------------------------------------------------------
-    # 12. Verify output
-    # ------------------------------------------------------------
-    - name: Verify kernel output
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        echo "=============================================="
-        echo " BUILD OUTPUT"
-        echo "=============================================="
-
-        echo
-        echo "Kernel image:"
-
-        if [ -f "$OUT/arch/arm64/boot/Image" ]; then
-          ls -lh "$OUT/arch/arm64/boot/Image"
-        else
-          echo "::error::Image was not generated."
-          exit 1
-        fi
-
-        echo
-        echo "Kernel release:"
-
-        cd "$KERNEL_DIR"
-
-        make \
-          O="$OUT" \
-          ARCH=arm64 \
-          LLVM="$CLANG_PATH/" \
-          LLVM_IAS=1 \
-          kernelrelease
-
-        echo
-        echo "VMLINUX:"
-        if [ -f "$OUT/vmlinux" ]; then
-          ls -lh "$OUT/vmlinux"
-        fi
-
-    # ------------------------------------------------------------
-    # 13. Package
-    # ------------------------------------------------------------
-    - name: Package kernel
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        PKG="$GITHUB_WORKSPACE/package"
-
-        rm -rf "$PKG"
-        mkdir -p "$PKG"
-
-        cp \
-          "$OUT/arch/arm64/boot/Image" \
-          "$PKG/Image"
-
-        if [ -d "$OUT/arch/arm64/boot/dts" ]; then
-          cp -a \
-            "$OUT/arch/arm64/boot/dts" \
-            "$PKG/dts"
-        fi
-
-        if [ -f "$OUT/System.map" ]; then
-          cp "$OUT/System.map" "$PKG/"
-        fi
-
-        if [ -f "$OUT/.config" ]; then
-          cp "$OUT/.config" "$PKG/kernel.config"
-        fi
-
-        if [ -f "$OUT/vmlinux" ]; then
-          cp "$OUT/vmlinux" "$PKG/vmlinux"
-        fi
-
-        cd "$PKG"
-
-        zip -r \
-          "$GITHUB_WORKSPACE/A135F-4.19.198-MAX-ARAF.zip" \
-          .
-
-    # ------------------------------------------------------------
-    # 14. Upload artifact
-    # ------------------------------------------------------------
-    - name: Upload kernel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: A135F-4.19.198-MAX-ARAF
-        path: |
-          A135F-4.19.198-MAX-ARAF.zip
-          package/
-        if-no-files-found: error
-        compression-level: 0
+          echo "Kernel archive extracted."
+
+          echo
+          echo "Top-level directories:"
+          find "$KERNEL_UNPACK" -maxdepth 2 -type d -print | sort | head -100
+
+      # ============================================================
+      # 7. SMART KERNEL ROOT DETECTION
+      # ============================================================
+      - name: Detect kernel root
+        id: detect_kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE/kernel-unpack"
+
+          echo "Searching for Samsung kernel root..."
+          echo
+
+          CANDIDATE=""
+
+          while IFS= read -r -d '' MAKEFILE; do
+            DIR="$(dirname "$MAKEFILE")"
+
+            # Must have arch/arm64
+            [ -d "$DIR/arch/arm64" ] || continue
+
+            # Must have an ARM64 kernel config directory
+            [ -d "$DIR/arch/arm64/configs" ] || continue
+
+            # Must have Linux kernel Makefile fields
+            if ! grep -qE '^[[:space:]]*VERSION[[:space:]]*=' "$MAKEFILE"; then
+              continue
+            fi
+
+            if ! grep -qE '^[[:space:]]*PATCHLEVEL[[:space:]]*=' "$MAKEFILE"; then
+              continue
+            fi
+
+            if ! grep -qE '^[[:space:]]*SUBLEVEL[[:space:]]*=' "$MAKEFILE"; then
+              continue
+            fi
+
+            # Prefer the exact A135F defconfig
+            if [ -f "$DIR/arch/arm64/configs/$EXPECTED_DEFCONFIG" ]; then
+              CANDIDATE="$DIR"
+              break
+            fi
+
+            # Backup candidate
+            if [ -z "$CANDIDATE" ]; then
+              CANDIDATE="$DIR"
+            fi
+
+          done < <(
+            find "$ROOT" \
+              -type f \
+              -name "Makefile" \
+              -print0
+          )
+
+          if [ -z "$CANDIDATE" ]; then
+            echo "::error::No valid Linux kernel root found."
+            find "$ROOT" -maxdepth 5 -type f | sort | head -500
+            exit 1
+          fi
+
+          echo
+          echo "=============================================="
+          echo "SELECTED KERNEL ROOT"
+          echo "=============================================="
+          echo "$CANDIDATE"
+
+          echo "kernel_dir=$CANDIDATE" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 8. VERIFY KERNEL VERSION
+      # ============================================================
+      - name: Verify Linux 4.19.198 source
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          VERSION="$(awk '$1=="VERSION" {print $3; exit}' Makefile)"
+          PATCHLEVEL="$(awk '$1=="PATCHLEVEL" {print $3; exit}' Makefile)"
+          SUBLEVEL="$(awk '$1=="SUBLEVEL" {print $3; exit}' Makefile)"
+          EXTRAVERSION="$(awk '$1=="EXTRAVERSION" {print $3; exit}' Makefile || true)"
+
+          EXTRAVERSION="${EXTRAVERSION:-}"
+
+          KERNEL_VERSION="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}${EXTRAVERSION}"
+
+          echo "VERSION      = $VERSION"
+          echo "PATCHLEVEL   = $PATCHLEVEL"
+          echo "SUBLEVEL     = $SUBLEVEL"
+          echo "EXTRAVERSION = $EXTRAVERSION"
+          echo
+          echo "Detected kernel version: $KERNEL_VERSION"
+
+          if [ "$KERNEL_VERSION" != "$EXPECTED_KERNEL_VERSION" ]; then
+            echo "::error::Wrong kernel version."
+            echo "Expected: $EXPECTED_KERNEL_VERSION"
+            echo "Found   : $KERNEL_VERSION"
+            exit 1
+          fi
+
+          echo
+          echo "Kernel version verification PASSED."
+
+      # ============================================================
+      # 9. VERIFY DEFCONFIG
+      # ============================================================
+      - name: Verify A135F defconfig
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          CONFIG_DIR="arch/arm64/configs"
+
+          echo "Available Exynos850 configs:"
+          find "$CONFIG_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*exynos850*" \
+            -printf "%f\n" \
+            | sort || true
+
+          echo
+
+          if [ ! -f "$CONFIG_DIR/$EXPECTED_DEFCONFIG" ]; then
+            echo "::error::Expected defconfig not found:"
+            echo "$EXPECTED_DEFCONFIG"
+
+            echo
+            echo "Matching configs:"
+            find "$CONFIG_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -iname "*a13*" \
+              -printf "%f\n" \
+              | sort || true
+
+            exit 1
+          fi
+
+          echo "Defconfig found:"
+          echo "$CONFIG_DIR/$EXPECTED_DEFCONFIG"
+
+      # ============================================================
+      # 10. SHOW ORIGINAL TOOLCHAIN REFERENCES
+      # ============================================================
+      - name: Inspect Samsung toolchain references
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          echo "=============================================="
+          echo "ORIGINAL TOOLCHAIN REFERENCES"
+          echo "=============================================="
+
+          grep -nE \
+            'clang-r[0-9]+|CROSS_COMPILE|CLANG_TRIPLE|CLANG_PATH' \
+            Makefile \
+            2>/dev/null || true
+
+          echo
+          echo "=============================================="
+          echo "KERNEL VERSION FIELDS"
+          echo "=============================================="
+
+          grep -nE \
+            '^[[:space:]]*(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION)[[:space:]]*=' \
+            Makefile \
+            || true
+
+      # ============================================================
+      # 11. DOWNLOAD AOSP CLANG r383902
+      # ============================================================
+      - name: Download Android Clang r383902
+        id: clang
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOOLCHAIN_DIR="$GITHUB_WORKSPACE/toolchains"
+          CLANG_DIR="$TOOLCHAIN_DIR/$CLANG_RELEASE"
+
+          mkdir -p "$TOOLCHAIN_DIR"
+
+          if [ ! -x "$CLANG_DIR/bin/clang" ]; then
+
+            TMP="$TOOLCHAIN_DIR/clang-r383902.tar.gz"
+
+            echo "Downloading Android Clang:"
+            echo "$CLANG_RELEASE"
+
+            curl -L \
+              --fail \
+              --retry 5 \
+              --retry-delay 3 \
+              -o "$TMP" \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/$CLANG_RELEASE.tar.gz"
+
+            mkdir -p "$CLANG_DIR"
+
+            tar -xzf "$TMP" -C "$CLANG_DIR"
+
+            rm -f "$TMP"
+          fi
+
+          if [ ! -x "$CLANG_DIR/bin/clang" ]; then
+            echo "::error::clang-r383902 installation failed."
+
+            echo "Searching for clang:"
+            find "$TOOLCHAIN_DIR" \
+              -type f \
+              -name clang \
+              -o -name clang-10 \
+              | sort || true
+
+            exit 1
+          fi
+
+          echo
+          echo "Clang path:"
+          echo "$CLANG_DIR/bin"
+
+          echo
+          echo "Clang version:"
+          "$CLANG_DIR/bin/clang" --version
+
+          echo "clang_bin=$CLANG_DIR/bin" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 12. PREPARE BUILD ENVIRONMENT
+      # ============================================================
+      - name: Prepare kernel build
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+          CLANG_BIN: ${{ steps.clang.outputs.clang_bin }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          export PATH="$CLANG_BIN:$PATH"
+
+          echo "=============================================="
+          echo "BUILD ENVIRONMENT"
+          echo "=============================================="
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          # Android 14 / U
+          export PLATFORM_VERSION=14
+          export ANDROID_MAJOR_VERSION=u
+
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          export CC="$CLANG_BIN/clang"
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+
+          echo "ARCH=$ARCH"
+          echo "SUBARCH=$SUBARCH"
+          echo "PLATFORM_VERSION=$PLATFORM_VERSION"
+          echo "ANDROID_MAJOR_VERSION=$ANDROID_MAJOR_VERSION"
+          echo "CROSS_COMPILE=$CROSS_COMPILE"
+          echo "CLANG_TRIPLE=$CLANG_TRIPLE"
+          echo "CC=$CC"
+
+          echo
+          echo "Checking compiler..."
+
+          clang --version
+          aarch64-linux-gnu-gcc --version | head -1
+
+      # ============================================================
+      # 13. CLEAN + DEFCONFIG
+      # ============================================================
+      - name: Configure kernel
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+          CLANG_BIN: ${{ steps.clang.outputs.clang_bin }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          export PATH="$CLANG_BIN:$PATH"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          export PLATFORM_VERSION=14
+          export ANDROID_MAJOR_VERSION=u
+
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          export CC="$CLANG_BIN/clang"
+
+          echo "Cleaning previous configuration..."
+          make mrproper
+
+          echo
+          echo "Running defconfig:"
+          echo "$EXPECTED_DEFCONFIG"
+
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC="$CC" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$EXPECTED_DEFCONFIG"
+
+          echo
+          echo "Config generated successfully."
+
+          test -f .config
+
+          echo
+          echo "Kernel local version:"
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC="$CC" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            kernelrelease \
+            LOCALVERSION="$KERNEL_LOCALVERSION"
+
+      # ============================================================
+      # 14. BUILD
+      # ============================================================
+      - name: Build kernel
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+          CLANG_BIN: ${{ steps.clang.outputs.clang_bin }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          export PATH="$CLANG_BIN:$PATH"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          export PLATFORM_VERSION=14
+          export ANDROID_MAJOR_VERSION=u
+
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          export CC="$CLANG_BIN/clang"
+
+          JOBS="${{ inputs.jobs }}"
+
+          if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
+            JOBS=2
+          fi
+
+          echo "=============================================="
+          echo "STARTING KERNEL BUILD"
+          echo "Jobs: $JOBS"
+          echo "=============================================="
+
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC="$CC" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            LOCALVERSION="$KERNEL_LOCALVERSION" \
+            -j"$JOBS" \
+            2>&1 | tee "$GITHUB_WORKSPACE/kernel-build.log"
+
+      # ============================================================
+      # 15. POST-BUILD VERIFICATION
+      # ============================================================
+      - name: Verify kernel output
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+          CLANG_BIN: ${{ steps.clang.outputs.clang_bin }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          export PATH="$CLANG_BIN:$PATH"
+
+          echo "=============================================="
+          echo "BUILD OUTPUT"
+          echo "=============================================="
+
+          find arch/arm64/boot \
+            -maxdepth 4 \
+            -type f \
+            | sort \
+            | head -300
+
+          echo
+          echo "Checking Image..."
+
+          if [ ! -f arch/arm64/boot/Image ]; then
+            echo "::error::arch/arm64/boot/Image was not generated."
+            exit 1
+          fi
+
+          IMAGE_SIZE="$(stat -c%s arch/arm64/boot/Image)"
+
+          echo "Image size: $IMAGE_SIZE bytes"
+
+          if [ "$IMAGE_SIZE" -lt 1000000 ]; then
+            echo "::error::Image is suspiciously small."
+            exit 1
+          fi
+
+          echo
+          echo "Checking kernelrelease..."
+
+          KERNEL_RELEASE="$(
+            make \
+              ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CC="$CLANG_BIN/clang" \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              kernelrelease \
+              LOCALVERSION="$KERNEL_LOCALVERSION"
+          )"
+
+          echo "Kernel release: $KERNEL_RELEASE"
+
+          case "$KERNEL_RELEASE" in
+            4.19.198*)
+              echo "Kernel release verification PASSED."
+              ;;
+            *)
+              echo "::error::Unexpected kernelrelease: $KERNEL_RELEASE"
+              exit 1
+              ;;
+          esac
+
+          echo "$KERNEL_RELEASE" > "$GITHUB_WORKSPACE/kernel-release.txt"
+
+      # ============================================================
+      # 16. PACKAGE BUILD OUTPUT
+      # ============================================================
+      - name: Package kernel output
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE="$GITHUB_WORKSPACE/A135F-Kernel-4.19.198-MAX-ARAF"
+
+          rm -rf "$PACKAGE"
+          mkdir -p "$PACKAGE"
+
+          echo "Copying Image..."
+          cp "$KERNEL_DIR/arch/arm64/boot/Image" \
+            "$PACKAGE/Image"
+
+          echo "Copying config..."
+          cp "$KERNEL_DIR/.config" \
+            "$PACKAGE/config"
+
+          if [ -f "$KERNEL_DIR/System.map" ]; then
+            cp "$KERNEL_DIR/System.map" \
+              "$PACKAGE/System.map"
+          fi
+
+          if [ -f "$KERNEL_DIR/Module.symvers" ]; then
+            cp "$KERNEL_DIR/Module.symvers" \
+              "$PACKAGE/Module.symvers"
+          fi
+
+          if [ -f "$KERNEL_DIR/vmlinux" ]; then
+            cp "$KERNEL_DIR/vmlinux" \
+              "$PACKAGE/vmlinux"
+          fi
+
+          echo "Copying DTB files..."
+
+          mkdir -p "$PACKAGE/dtb"
+
+          find "$KERNEL_DIR/arch/arm64/boot" \
+            -type f \
+            \( -name "*.dtb" -o -name "*.dtbo" \) \
+            -exec cp --parents {} "$PACKAGE/dtb/" \; \
+            2>/dev/null || true
+
+          if [ -f "$KERNEL_DIR/arch/arm64/boot/dtbo.img" ]; then
+            cp "$KERNEL_DIR/arch/arm64/boot/dtbo.img" \
+              "$PACKAGE/dtbo.img"
+          fi
+
+          cp "$GITHUB_WORKSPACE/kernel-release.txt" \
+            "$PACKAGE/kernel-release.txt"
+
+          cat > "$PACKAGE/BUILD_INFO.txt" <<EOF
+          Device: Samsung Galaxy A13 SM-A135F
+          Kernel source: Official Samsung OpenSource
+          Kernel version: 4.19.198
+          Local version: -MAX-ARAF
+          Defconfig: exynos850-a13xx_defconfig
+          Compiler: Android Clang r383902
+          Architecture: arm64
+          Build system: GitHub Actions
+          EOF
+
+          echo
+          echo "=============================================="
+          echo "PACKAGE CONTENTS"
+          echo "=============================================="
+
+          find "$PACKAGE" -type f -printf "%p %s bytes\n" | sort
+
+          cd "$GITHUB_WORKSPACE"
+
+          zip -r -9 \
+            "A135F-Kernel-4.19.198-MAX-ARAF.zip" \
+            "$(basename "$PACKAGE")"
+
+          echo
+          echo "Final ZIP:"
+          ls -lh "A135F-Kernel-4.19.198-MAX-ARAF.zip"
+
+      # ============================================================
+      # 17. UPLOAD ARTIFACTS
+      # ============================================================
+      - name: Upload kernel ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: A135F-Kernel-4.19.198-MAX-ARAF
+          path: |
+            A135F-Kernel-4.19.198-MAX-ARAF.zip
+            kernel-build.log
+            kernel-release.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      # ============================================================
+      # 18. BUILD SUMMARY
+      # ============================================================
+      - name: Build summary
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## A135F Kernel Build"
+            echo
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Device | Samsung Galaxy A13 SM-A135F |"
+            echo "| Source | Official Samsung OpenSource |"
+            echo "| Kernel | 4.19.198 |"
+            echo "| Defconfig | exynos850-a13xx_defconfig |"
+            echo "| Localversion | -MAX-ARAF |"
+            echo "| Clang | r383902 |"
+            echo "| Architecture | arm64 |"
+            echo "| Result | ✅ BUILD SUCCESS |"
+          } >> "$GITHUB_STEP_SUMMARY"
