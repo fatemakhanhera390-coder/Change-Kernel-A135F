@@ -460,10 +460,189 @@ jobs:
 
           echo "clang_bin=$CLANG_DIR/bin" >> "$GITHUB_OUTPUT"
 
+            # ============================================================
+            # ============================================================
+      # 12. PREPARE SAMSUNG TOOLCHAIN COMPATIBILITY
       # ============================================================
-      # 12. PREPARE BUILD ENVIRONMENT
+      - name: Prepare Samsung toolchain compatibility
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          echo "=============================================="
+          echo "SAMSUNG TOOLCHAIN COMPATIBILITY"
+          echo "=============================================="
+
+          # Downloaded clang location
+          REAL_CLANG_DIR="$GITHUB_WORKSPACE/toolchains/clang-r383902"
+
+          # Samsung source expects this exact location
+          SAMSUNG_CLANG_DIR="$KERNEL_DIR/toolchain/clang/host/linux-x86/clang-r383902"
+
+          echo "Real clang:"
+          echo "$REAL_CLANG_DIR"
+
+          echo "Samsung expected clang:"
+          echo "$SAMSUNG_CLANG_DIR"
+
+          # Verify downloaded compiler
+          if [ ! -x "$REAL_CLANG_DIR/bin/clang" ]; then
+            echo "::error::clang-r383902 was not found."
+            echo "Expected:"
+            echo "$REAL_CLANG_DIR/bin/clang"
+            exit 1
+          fi
+
+          # Remove old/broken path if present
+          rm -rf "$SAMSUNG_CLANG_DIR"
+
+          # Create parent directory
+          mkdir -p "$(dirname "$SAMSUNG_CLANG_DIR")"
+
+          # Create compatibility symlink
+          ln -s "$REAL_CLANG_DIR" "$SAMSUNG_CLANG_DIR"
+
+          echo
+          echo "Checking Samsung clang path..."
+
+          if [ ! -x "$SAMSUNG_CLANG_DIR/bin/clang" ]; then
+            echo "::error::Samsung clang compatibility path failed."
+            exit 1
+          fi
+
+          "$SAMSUNG_CLANG_DIR/bin/clang" --version
+
+          echo
+          echo "=============================================="
+          echo "TOOLCHAIN READY"
+          echo "=============================================="
+
+          echo "clang:"
+          "$SAMSUNG_CLANG_DIR/bin/clang" --version | head -1
+
+          echo
+          echo "clang path:"
+          readlink -f "$SAMSUNG_CLANG_DIR/bin/clang"
+
+
       # ============================================================
-      - name: Prepare kernel build
+      # 13. CONFIGURE KERNEL
+      # ============================================================
+      - name: Configure kernel
+        shell: bash
+        env:
+          KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$KERNEL_DIR"
+
+          SAMSUNG_CLANG_DIR="$KERNEL_DIR/toolchain/clang/host/linux-x86/clang-r383902"
+
+          export PATH="$SAMSUNG_CLANG_DIR/bin:$PATH"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          export PLATFORM_VERSION=14
+          export ANDROID_MAJOR_VERSION=u
+
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          export CC="$SAMSUNG_CLANG_DIR/bin/clang"
+
+          echo "=============================================="
+          echo "CONFIGURING A135F 4.19.198"
+          echo "=============================================="
+
+          echo
+          echo "Kernel root:"
+          pwd
+
+          echo
+          echo "Defconfig:"
+          echo "$EXPECTED_DEFCONFIG"
+
+          echo
+          echo "Compiler:"
+          "$CC" --version | head -1
+
+          # --------------------------------------------------------
+          # DO NOT RUN MRPROPER
+          # Fresh Samsung source is already extracted.
+          # --------------------------------------------------------
+
+          rm -f .config
+
+          if [ -f include/config/auto.conf ]; then
+            rm -f include/config/auto.conf
+          fi
+
+          echo
+          echo "Running defconfig..."
+
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC="$CC" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$EXPECTED_DEFCONFIG"
+
+          echo
+          echo "=============================================="
+          echo "DEFCONFIG SUCCESS"
+          echo "=============================================="
+
+          test -f .config
+
+          echo
+          echo "Checking important configuration..."
+
+          grep -E \
+            'CONFIG_ARM64=|CONFIG_ARCH_EXYNOS=|CONFIG_EXYNOS850=' \
+            .config || true
+
+          echo
+          echo "Checking kernel version..."
+
+          KREL="$(
+            make \
+              ARCH=arm64 \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              CLANG_TRIPLE="$CLANG_TRIPLE" \
+              CC="$CC" \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              LOCALVERSION="$KERNEL_LOCALVERSION" \
+              kernelrelease
+          )"
+
+          echo
+          echo "Kernel release:"
+          echo "$KREL"
+
+          case "$KREL" in
+            4.19.198*)
+              echo "Kernel release verification PASSED."
+              ;;
+            *)
+              echo "::error::Unexpected kernel release: $KREL"
+              exit 1
+              ;;
+          esac
+
+
+      # ============================================================
+      # 13. CONFIGURE KERNEL
+      # ============================================================
+      - name: Configure kernel
         shell: bash
         env:
           KERNEL_DIR: ${{ steps.detect_kernel.outputs.kernel_dir }}
@@ -473,39 +652,113 @@ jobs:
 
           cd "$KERNEL_DIR"
 
-          export PATH="$CLANG_BIN:$PATH"
+          EXPECTED_CLANG_DIR="$KERNEL_DIR/toolchain/clang/host/linux-x86/clang-r383902"
 
-          echo "=============================================="
-          echo "BUILD ENVIRONMENT"
-          echo "=============================================="
+          export PATH="$EXPECTED_CLANG_DIR/bin:$PATH"
 
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # Android 14 / U
           export PLATFORM_VERSION=14
           export ANDROID_MAJOR_VERSION=u
 
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CLANG_TRIPLE=aarch64-linux-gnu-
 
-          export CC="$CLANG_BIN/clang"
-          export HOSTCC=clang
-          export HOSTCXX=clang++
+          export CC="$EXPECTED_CLANG_DIR/bin/clang"
 
-          echo "ARCH=$ARCH"
-          echo "SUBARCH=$SUBARCH"
-          echo "PLATFORM_VERSION=$PLATFORM_VERSION"
-          echo "ANDROID_MAJOR_VERSION=$ANDROID_MAJOR_VERSION"
-          echo "CROSS_COMPILE=$CROSS_COMPILE"
-          echo "CLANG_TRIPLE=$CLANG_TRIPLE"
-          echo "CC=$CC"
+          echo "=============================================="
+          echo "CONFIGURING A135F KERNEL"
+          echo "=============================================="
 
           echo
-          echo "Checking compiler..."
+          echo "Kernel root:"
+          pwd
 
-          clang --version
-          aarch64-linux-gnu-gcc --version | head -1
+          echo
+          echo "Defconfig:"
+          echo "$EXPECTED_DEFCONFIG"
+
+          # --------------------------------------------------------
+          # IMPORTANT:
+          # DO NOT RUN make mrproper HERE.
+          #
+          # Source was freshly extracted from Samsung archive.
+          # mrproper was causing missing vendor Makefile errors.
+          # --------------------------------------------------------
+
+          if [ -f .config ]; then
+            echo "Removing previous .config only..."
+            rm -f .config
+          fi
+
+          if [ -f include/config/auto.conf ]; then
+            rm -f include/config/auto.conf
+          fi
+
+          echo
+          echo "Running Samsung defconfig..."
+
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CC="$CC" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$EXPECTED_DEFCONFIG"
+
+          echo
+          echo "=============================================="
+          echo "DEFCONFIG SUCCESS"
+          echo "=============================================="
+
+          test -f .config
+
+          echo
+          echo "Checking generated config..."
+
+          grep -E \
+            'CONFIG_ARM64=|CONFIG_ARCH_EXYNOS=|CONFIG_EXYNOS850=' \
+            .config \
+            || true
+
+          echo
+          echo "Checking kernel release..."
+
+          KREL="$(
+            make \
+              ARCH=arm64 \
+              CROSS_COMPILE="$CROSS_COMPILE" \
+              CLANG_TRIPLE="$CLANG_TRIPLE" \
+              CC="$CC" \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              LOCALVERSION="$KERNEL_LOCALVERSION" \
+              kernelrelease
+          )"
+
+          echo
+          echo "Kernel release:"
+          echo "$KREL"
+
+          case "$KREL" in
+            4.19.198*)
+              echo "Kernel release OK."
+              ;;
+            *)
+              echo "::error::Unexpected kernel release: $KREL"
+              exit 1
+              ;;
+          esac
+          # Samsung GCC compatibility path
+          EXPECTED_GCC_DIR="$KERNEL_DIR/toolchain/gcc/linux-x86/aarch64-linux-android-4.9"
+
+          if [ ! -d "$EXPECTED_GCC_DIR" ]; then
+          echo
+          echo "Samsung GCC 4.9 directory is not present."
+          echo "LLVM build will be attempted first."
+          fi
 
       # ============================================================
       # 13. CLEAN + DEFCONFIG
